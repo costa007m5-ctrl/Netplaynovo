@@ -5,6 +5,7 @@ import Hls from 'hls.js';
 import { motion, AnimatePresence } from 'motion/react';
 import { QRCodeSVG } from 'qrcode.react';
 import { supabase } from '../lib/supabase';
+import { useNetworkDiagnostics } from '../hooks/useNetworkDiagnostics';
 
 interface NetflixPlayerProps {
   src: string;
@@ -77,8 +78,6 @@ const NetflixPlayer: React.FC<NetflixPlayerProps> = ({
     // para dar autoplay real (clicou, começou) e permitir retry/proxy interno.
     if (lowerSrc.includes('video_url=')) {
       return false;
-    }
-      return true;
     }
 
     return false;
@@ -371,10 +370,18 @@ const NetflixPlayer: React.FC<NetflixPlayerProps> = ({
   const [showQualityMenu, setShowQualityMenu] = useState(false);
   const [canCast, setCanCast] = useState(false);
   const [isCasting, setIsCasting] = useState(false);
-  const [qualityToast, setQualityToast] = useState<string | null>(null);
+const [qualityToast, setQualityToast] = useState<string | null>(null);
+  
+  // Hook de diagnóstico de rede para otimização adaptativa
+  // Nota: callback removido para evitar re-renders durante loading
+  const { getOptimizedHlsConfig } = useNetworkDiagnostics({
+    checkInterval: 60000, // Verifica a cada 60s (menos frequente para evitar interferência)
+    enablePrefetch: false,
+  });
+  
   const [autoRotate, setAutoRotate] = useState(() => {
-    const saved = localStorage.getItem('autoRotate');
-    return saved !== null ? JSON.parse(saved) : true;
+  const saved = localStorage.getItem('autoRotate');
+  return saved !== null ? JSON.parse(saved) : true;
   });
   const [objectFit, setObjectFit] = useState<'contain' | 'cover'>('contain');
   const [emotes, setEmotes] = useState<{ id: string | number; emoji: string; x: number; y: number; profileName?: string }[]>([]);
@@ -740,50 +747,52 @@ const lowerSrc = videoToPlay.toLowerCase();
           const isIOS = /iP(hone|od|ad)/i.test(navigator.userAgent);
           
 if (Hls.isSupported() && !isIOS) {
+  // Obtém configuração otimizada baseada na qualidade atual da rede
+  const networkOptimizedConfig = getOptimizedHlsConfig();
+  
+  // Configuração híbrida: usa valores agressivos para início rápido
+  // mas permite que a rede influencie buffers e timeouts
   const hls = new Hls({
+  // Configurações base para início rápido
   enableWorker: true,
   lowLatencyMode: true,
   startFragPrefetch: true,
   capLevelToPlayerSize: true,
   autoStartLoad: true,
   // startLevel: 0 → começa pela QUALIDADE MAIS BAIXA (menor fragmento, download rápido)
-  // O HLS.js sobe a qualidade automaticamente após medir a banda.
   startLevel: 0,
-  // Assume 2Mbps para iniciar imediatamente com qualidade razoável
-  abrEwmaDefaultEstimate: 2000000,
-  // Fator rápido para subir qualidade mais agressivamente após iniciar
+  // Estima bandwidth baseado na qualidade da rede detectada
+  abrEwmaDefaultEstimate: networkOptimizedConfig.abrEwmaDefaultEstimate || 2000000,
+  // Fatores ABR agressivos para subir qualidade rapidamente
   abrEwmaFastLive: 2.0,
   abrEwmaSlowLive: 4.0,
   abrEwmaFastVoD: 2.0,
   abrEwmaSlowVoD: 4.0,
-  testBandwidth: false, // não desperdiça tempo medindo banda antes de tocar
+  testBandwidth: false,
   startPosition: startPoint > 0 ? startPoint : -1,
-  // Buffer ULTRA MÍNIMO para iniciar o playback INSTANTANEAMENTE
-  maxBufferLength: 2, // Apenas 2s de buffer para começar
-  maxMaxBufferLength: 30, // Depois aumenta até 30s
-  backBufferLength: 0, // Não guarda buffer atrás
-  maxBufferSize: 30 * 1000 * 1000, // 30MB
-  maxBufferHole: 0.8, // Tolera buracos maiores no buffer
-  // Timeouts ULTRA agressivos — falha rápido para tentar novamente
-  manifestLoadingMaxRetry: 5,
-  levelLoadingMaxRetry: 5,
-  fragLoadingMaxRetry: 5,
-  manifestLoadingRetryDelay: 100, // 100ms entre retries
-  levelLoadingRetryDelay: 100,
-  fragLoadingRetryDelay: 100,
-  manifestLoadingTimeOut: 5000, // 5s max para manifesto
-  levelLoadingTimeOut: 5000,
-  fragLoadingTimeOut: 8000, // 8s para fragmentos
-  // Deixa o HLS começar a tocar com MÍNIMO buffer
-  maxStarvationDelay: 1, // 1s máximo de espera por starvation
-  maxLoadingDelay: 1, // 1s máximo de loading delay
+  // Buffer inicial mínimo para começar rápido, depois adapta baseado na rede
+  maxBufferLength: Math.max(2, networkOptimizedConfig.maxBufferLength || 2),
+  maxMaxBufferLength: networkOptimizedConfig.maxMaxBufferLength || 30,
+  backBufferLength: 0,
+  maxBufferSize: networkOptimizedConfig.maxBufferSize || 30 * 1000 * 1000,
+  maxBufferHole: 0.8,
+  // Timeouts mais tolerantes para proxies que demoram a inicializar (ex: kingx.dev)
+  manifestLoadingMaxRetry: networkOptimizedConfig.manifestLoadingMaxRetry || 8,
+  levelLoadingMaxRetry: networkOptimizedConfig.levelLoadingMaxRetry || 8,
+  fragLoadingMaxRetry: networkOptimizedConfig.fragLoadingMaxRetry || 8,
+  manifestLoadingRetryDelay: networkOptimizedConfig.manifestLoadingRetryDelay || 500,
+  levelLoadingRetryDelay: networkOptimizedConfig.levelLoadingRetryDelay || 500,
+  fragLoadingRetryDelay: networkOptimizedConfig.fragLoadingRetryDelay || 300,
+  manifestLoadingTimeOut: networkOptimizedConfig.manifestLoadingTimeOut || 15000, // 15s para manifesto
+  levelLoadingTimeOut: networkOptimizedConfig.levelLoadingTimeOut || 15000,
+  fragLoadingTimeOut: networkOptimizedConfig.fragLoadingTimeOut || 20000, // 20s para fragmentos
+  // Delays adaptativos baseados na rede
+  maxStarvationDelay: networkOptimizedConfig.maxStarvationDelay || 1,
+  maxLoadingDelay: networkOptimizedConfig.maxLoadingDelay || 1,
   nudgeMaxRetry: 5,
-  nudgeOffset: 0.2, // Nudge mais agressivo
-  // Reduz threshold para começar playback mais cedo
+  nudgeOffset: 0.2,
   highBufferWatchdogPeriod: 0.5,
-  // Streaming agressivo - começa antes do buffer completo
   stretchShortVideoTrack: true,
-  // Prefetch do próximo fragmento enquanto reproduz
   progressive: true,
             });
             hls.attachMedia(video);
@@ -833,15 +842,23 @@ if (Hls.isSupported() && !isIOS) {
                  if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
                    // Fail fast for 403 Forbidden or 404 Not Found as retrying won't help
                    if (data.response?.code === 403 || data.response?.code === 404) {
-                     setError({ message: "Link expirado ou acesso negado. Feche e tente reproduzir novamente ou escollha outro player.", type: 'network' });
+                     setError({ message: "Link expirado ou acesso negado. Feche e tente reproduzir novamente ou escolha outro player.", type: 'format' });
                      setIsLoading(false);
                      return;
                    }
-                   if (retryCountRef.current < 10) { 
+                   // Proxies como kingx.dev/teradl podem precisar de mais tempo para inicializar
+                   // Aumentamos para 20 tentativas com delays mais longos
+                   const MAX_RETRIES = 20;
+                   if (retryCountRef.current < MAX_RETRIES) { 
                      retryCountRef.current++;
-                     setProgressTarget(Math.max(targetProgressRef.current, 20));
-                     // Retry rápido com backoff exponencial: 200ms, 400ms, 800ms...
-                     const retryDelay = Math.min(200 * Math.pow(2, retryCountRef.current - 1), 2000);
+                     // Atualiza progresso visual para mostrar que está tentando
+                     const progressIncrease = Math.min(5, (100 - targetProgressRef.current) / (MAX_RETRIES - retryCountRef.current + 1));
+                     setProgressTarget(Math.min(95, targetProgressRef.current + progressIncrease));
+                     
+                     // Delay mais longo para dar tempo ao proxy: 500ms, 1s, 1.5s, 2s, 2.5s, 3s (max)
+                     const retryDelay = Math.min(500 + (retryCountRef.current * 500), 3000);
+                     console.log(`[v0] HLS retry ${retryCountRef.current}/${MAX_RETRIES} em ${retryDelay}ms`);
+                     
                      setTimeout(() => {
                        // Reload source completely if manifest failed to load, else try to recover chunks
                        if (data.details === Hls.ErrorDetails.MANIFEST_LOAD_ERROR || 
@@ -850,9 +867,9 @@ if (Hls.isSupported() && !isIOS) {
                        } else {
                            hls.startLoad();
                        }
-                     }, retryDelay); // Retry rápido com backoff
+                     }, retryDelay);
                    } else {
-                     setError({ message: "Falha contínua na conexão. O servidor pode estar offline ou bloqueado.", type: 'network' });
+                     setError({ message: "Não foi possível conectar ao servidor de vídeo após várias tentativas. Tente outro player ou verifique se o link ainda é válido.", type: 'format' });
                      setIsLoading(false);
                    }
                  }
@@ -2932,7 +2949,8 @@ video.removeEventListener('timeupdate', handleTimeUpdate);
             <ChevronLeft size={32} strokeWidth={3} />
          </button>
       )}
-    </div>
+
+      </div>
   );
 };
 
